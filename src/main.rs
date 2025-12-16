@@ -359,12 +359,46 @@ fn search_since_date(date: &str, pattern: &str, context: usize, directory: PathB
         pattern, date
     );
 
-    let files = get_tracked_files(&directory)?;
+    // Use git log -S (pickaxe) to find commits that added the pattern since the date
+    // This is MUCH faster than blaming every file
+    let log_output = Command::new("git")
+        .arg("log")
+        .arg(format!("--since={}", date))
+        .arg("-S")
+        .arg(pattern)
+        .arg("--format=%H")
+        .arg("--diff-filter=AM") // Only additions and modifications
+        .arg("--name-only")
+        .current_dir(&directory)
+        .output()
+        .context("Failed to execute git log")?;
+
+    if !log_output.status.success() {
+        anyhow::bail!("git log failed. Is this a git repository?");
+    }
+
+    // Parse the output to get unique files that have been modified
+    let output_str = String::from_utf8_lossy(&log_output.stdout);
+    let mut files_to_check = std::collections::HashSet::new();
+
+    for line in output_str.lines() {
+        let line = line.trim();
+        // Skip empty lines and commit hashes
+        if !line.is_empty() && !line.chars().all(|c| c.is_ascii_hexdigit()) {
+            files_to_check.insert(line.to_string());
+        }
+    }
+
+    if files_to_check.is_empty() {
+        println!("No files with '{}' changes found since {}.", pattern, date);
+        return Ok(());
+    }
 
     let mut all_matches: Vec<BlameMatch> = Vec::new();
 
-    for file in &files {
-        let matches = find_matches_with_blame(file, pattern, &directory)?;
+    // Only blame files that we know have had changes to the pattern
+    for file in files_to_check {
+        let matches = find_matches_with_blame(&file, pattern, &directory)?;
         for m in matches {
             if m.commit_date >= since_date {
                 all_matches.push(m);
