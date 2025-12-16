@@ -122,20 +122,29 @@ struct BlameMatch {
 }
 
 /// Parse git blame output and find matches for the pattern
-fn find_matches_with_blame(file: &str, pattern: &str, directory: &Path) -> Result<Vec<BlameMatch>> {
+fn find_matches_with_blame(
+    file: &str,
+    pattern: &str,
+    directory: &Path,
+    since_date: Option<&str>,
+) -> Result<Vec<BlameMatch>> {
     let file_path = directory.join(file);
     if !file_path.exists() {
         return Ok(vec![]);
     }
 
     // Run git blame with porcelain format for easy parsing
-    let output = Command::new("git")
-        .arg("blame")
-        .arg("--line-porcelain")
-        .arg(file)
-        .current_dir(directory)
-        .output()
-        .context("Failed to execute git blame")?;
+    let mut cmd = Command::new("git");
+    cmd.arg("blame").arg("--line-porcelain");
+
+    // Add --since to only trace history after the date (much faster)
+    if let Some(date) = since_date {
+        cmd.arg(format!("--since={}", date));
+    }
+
+    cmd.arg(file).current_dir(directory);
+
+    let output = cmd.output().context("Failed to execute git blame")?;
 
     if !output.status.success() {
         // File might not be tracked or other git error, skip it
@@ -151,11 +160,13 @@ fn find_matches_with_blame(file: &str, pattern: &str, directory: &Path) -> Resul
 
     for line in blame_output.lines() {
         // Line starting with a hash is the header line
+        // Format: <hash> <original-line> <final-line> [<num-lines>]
         if line.len() >= 40 && line.chars().take(40).all(|c| c.is_ascii_hexdigit()) {
             let parts: Vec<&str> = line.split_whitespace().collect();
             current_hash = parts[0].to_string();
-            if parts.len() >= 2 {
-                current_line_number = parts[1].parse().unwrap_or(0);
+            // Use parts[2] for final (current) line number, not parts[1] (original)
+            if parts.len() >= 3 {
+                current_line_number = parts[2].parse().unwrap_or(0);
             }
         } else if line.starts_with("committer-time ") {
             // Parse unix timestamp
@@ -321,7 +332,7 @@ fn search_since_date(date: &str, pattern: &str, context: usize, directory: PathB
     let all_matches: Vec<BlameMatch> = files_vec
         .par_iter()
         .map(|file| {
-            find_matches_with_blame(file, pattern, &directory)
+            find_matches_with_blame(file, pattern, &directory, Some(date))
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|m| m.commit_date >= since_date)
