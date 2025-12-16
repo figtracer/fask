@@ -111,9 +111,9 @@ fn search_current_files(
     Ok(())
 }
 
-/// Represents a match found via git blame
-#[derive(Debug)]
-struct BlameMatch {
+/// Represents a match found in git history
+#[derive(Debug, Clone)]
+struct GitMatch {
     file: String,
     line_number: usize,
     line_content: String,
@@ -121,71 +121,49 @@ struct BlameMatch {
     commit_hash: String,
 }
 
-/// Parse git blame output and find matches for the pattern
-fn find_matches_with_blame(
-    file: &str,
-    pattern: &str,
-    directory: &Path,
-    since_date: Option<&str>,
-) -> Result<Vec<BlameMatch>> {
-    let file_path = directory.join(file);
-    if !file_path.exists() {
-        return Ok(vec![]);
-    }
+/// Represents a line that was added in a commit (from diff parsing)
+#[derive(Debug)]
+struct AddedLine {
+    file: String,
+    content: String,
+    commit_date: NaiveDate,
+    commit_hash: String,
+}
 
-    // Run git blame with porcelain format for easy parsing
-    let mut cmd = Command::new("git");
-    cmd.arg("blame").arg("--line-porcelain");
-
-    // Add --since to only trace history after the date (much faster)
-    if let Some(date) = since_date {
-        cmd.arg(format!("--since={}", date));
-    }
-
-    cmd.arg(file).current_dir(directory);
-
-    let output = cmd.output().context("Failed to execute git blame")?;
-
-    if !output.status.success() {
-        // File might not be tracked or other git error, skip it
-        return Ok(vec![]);
-    }
-
-    let blame_output = String::from_utf8_lossy(&output.stdout);
-    let mut matches = Vec::new();
-
+/// Parse git log -p output to find lines that were added containing the pattern
+fn parse_git_log_diff(output: &str, pattern: &str) -> Vec<AddedLine> {
+    let mut results = Vec::new();
     let mut current_hash = String::new();
-    let mut current_line_number = 0usize;
     let mut current_date: Option<NaiveDate> = None;
+    let mut current_file: Option<String> = None;
 
-    for line in blame_output.lines() {
-        // Line starting with a hash is the header line
-        // Format: <hash> <original-line> <final-line> [<num-lines>]
-        if line.len() >= 40 && line.chars().take(40).all(|c| c.is_ascii_hexdigit()) {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            current_hash = parts[0].to_string();
-            // Use parts[2] for final (current) line number, not parts[1] (original)
-            if parts.len() >= 3 {
-                current_line_number = parts[2].parse().unwrap_or(0);
+    for line in output.lines() {
+        // Commit line: "commit <hash>"
+        if let Some(hash) = line.strip_prefix("commit ") {
+            current_hash = hash.trim().to_string();
+            current_date = None;
+            current_file = None;
+        }
+        // Date line: "Date: <date>"
+        else if let Some(date_str) = line.strip_prefix("Date:") {
+            // Parse date like "2025-01-15" from the formatted output
+            let date_str = date_str.trim();
+            if let Ok(date) = NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+                current_date = Some(date);
             }
-        } else if line.starts_with("committer-time ") {
-            // Parse unix timestamp
-            if let Some(timestamp_str) = line.strip_prefix("committer-time ") {
-                if let Ok(timestamp) = timestamp_str.trim().parse::<i64>() {
-                    current_date =
-                        chrono::DateTime::from_timestamp(timestamp, 0).map(|dt| dt.date_naive());
-                }
-            }
-        } else if let Some(content) = line.strip_prefix('\t') {
-            // This is the actual line content (prefixed with tab)
-            // Remove the leading tab
-
+        }
+        // Diff file header: "diff --git a/path b/path" or "+++ b/path"
+        else if let Some(rest) = line.strip_prefix("+++ b/") {
+            current_file = Some(rest.to_string());
+        }
+        // Added line in diff (starts with + but not +++)
+        else if line.starts_with('+') && !line.starts_with("+++") {
+            let content = &line[1..]; // Remove the leading +
             if content.contains(pattern) {
-                if let Some(date) = current_date {
-                    matches.push(BlameMatch {
-                        file: file.to_string(),
-                        line_number: current_line_number,
-                        line_content: content.to_string(),
+                if let (Some(date), Some(file)) = (current_date, &current_file) {
+                    results.push(AddedLine {
+                        file: file.clone(),
+                        content: content.to_string(),
                         commit_date: date,
                         commit_hash: current_hash.clone(),
                     });
@@ -194,7 +172,37 @@ fn find_matches_with_blame(
         }
     }
 
-    Ok(matches)
+    results
+}
+
+/// Find where an added line currently exists in a file (if it still exists)
+/// Returns the line number if found, along with the actual current line content
+fn find_line_in_current_file(
+    file: &str,
+    content: &str,
+    pattern: &str,
+    directory: &Path,
+) -> Option<(usize, String)> {
+    let file_path = directory.join(file);
+    let file_content = std::fs::read_to_string(&file_path).ok()?;
+
+    let content_trimmed = content.trim();
+
+    for (idx, line) in file_content.lines().enumerate() {
+        let line_trimmed = line.trim();
+
+        // The line must contain the pattern we're searching for
+        if !line.contains(pattern) {
+            continue;
+        }
+
+        // Check if this line matches the added content
+        // Either exact match or the content is contained in the line (handles minor changes)
+        if line_trimmed == content_trimmed || line_trimmed.contains(content_trimmed) {
+            return Some((idx + 1, line.to_string())); // 1-based line number
+        }
+    }
+    None
 }
 
 /// Read file contents to get context lines
@@ -207,12 +215,12 @@ fn read_file_lines(file: &str, directory: &Path) -> Result<Vec<String>> {
 
 /// Print matches with context
 fn print_matches_with_context(
-    matches: &[BlameMatch],
+    matches: &[GitMatch],
     context: usize,
     directory: &Path,
 ) -> Result<()> {
     // Group matches by file
-    let mut by_file: HashMap<String, Vec<&BlameMatch>> = HashMap::new();
+    let mut by_file: HashMap<String, Vec<&GitMatch>> = HashMap::new();
     for m in matches {
         by_file.entry(m.file.clone()).or_default().push(m);
     }
@@ -284,7 +292,7 @@ fn print_matches_with_context(
 
 fn search_since_date(date: &str, pattern: &str, context: usize, directory: PathBuf) -> Result<()> {
     // Validate and parse date
-    let since_date = NaiveDate::parse_from_str(date, "%Y-%m-%d")
+    let _since_date = NaiveDate::parse_from_str(date, "%Y-%m-%d")
         .context("Invalid date format. Use YYYY-MM-DD (e.g., 2025-12-01)")?;
 
     println!(
@@ -292,16 +300,17 @@ fn search_since_date(date: &str, pattern: &str, context: usize, directory: PathB
         pattern, date
     );
 
-    // Use git log -S (pickaxe) to find commits that added the pattern since the date
-    // This is MUCH faster than blaming every file
+    // Use git log -S with -p to get the actual diffs
+    // This is fast because -S (pickaxe) is optimized, and we get exact info about what was added
     let log_output = Command::new("git")
         .arg("log")
         .arg(format!("--since={}", date))
         .arg("-S")
         .arg(pattern)
-        .arg("--format=%H")
+        .arg("-p") // Show patches (diffs)
+        .arg("--format=commit %H%nDate: %ad")
+        .arg("--date=short")
         .arg("--diff-filter=AM") // Only additions and modifications
-        .arg("--name-only")
         .current_dir(&directory)
         .output()
         .context("Failed to execute git log")?;
@@ -310,44 +319,57 @@ fn search_since_date(date: &str, pattern: &str, context: usize, directory: PathB
         anyhow::bail!("git log failed. Is this a git repository?");
     }
 
-    // Parse the output to get unique files that have been modified
     let output_str = String::from_utf8_lossy(&log_output.stdout);
-    let mut files_to_check = std::collections::HashSet::new();
 
-    for line in output_str.lines() {
-        let line = line.trim();
-        // Skip empty lines and commit hashes
-        if !line.is_empty() && !line.chars().all(|c| c.is_ascii_hexdigit()) {
-            files_to_check.insert(line.to_string());
-        }
-    }
+    // Parse the diff output to find lines that were actually added
+    let added_lines = parse_git_log_diff(&output_str, pattern);
 
-    if files_to_check.is_empty() {
-        println!("No files with '{}' changes found since {}.", pattern, date);
+    if added_lines.is_empty() {
+        println!("No '{}' additions found since {}.", pattern, date);
         return Ok(());
     }
 
-    // Only blame files that we know have had changes to the pattern (in parallel)
-    let files_vec: Vec<String> = files_to_check.into_iter().collect();
-    let all_matches: Vec<BlameMatch> = files_vec
+    // Now find where these lines currently exist in the files (if they still exist)
+    // Process in parallel for speed
+    let all_matches: Vec<GitMatch> = added_lines
         .par_iter()
-        .map(|file| {
-            find_matches_with_blame(file, pattern, &directory, Some(date))
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|m| m.commit_date >= since_date)
-                .collect::<Vec<_>>()
+        .filter_map(|added| {
+            // Check if the file still exists and find the line
+            let file_path = directory.join(&added.file);
+            if !file_path.exists() {
+                return None;
+            }
+
+            // Find where this content is now in the file
+            find_line_in_current_file(&added.file, &added.content, pattern, &directory).map(
+                |(line_number, current_line)| GitMatch {
+                    file: added.file.clone(),
+                    line_number,
+                    line_content: current_line,
+                    commit_date: added.commit_date,
+                    commit_hash: added.commit_hash.clone(),
+                },
+            )
         })
-        .flatten()
         .collect();
 
-    if all_matches.is_empty() {
-        println!("No '{}' found in lines added since {}.", pattern, date);
+    // Deduplicate matches (same file + line number)
+    let mut seen = std::collections::HashSet::new();
+    let unique_matches: Vec<GitMatch> = all_matches
+        .into_iter()
+        .filter(|m| seen.insert((m.file.clone(), m.line_number)))
+        .collect();
+
+    if unique_matches.is_empty() {
+        println!(
+            "No '{}' found in lines added since {} (lines may have been removed).",
+            pattern, date
+        );
         return Ok(());
     }
 
-    println!("Found {} match(es):\n", all_matches.len());
-    print_matches_with_context(&all_matches, context, &directory)?;
+    println!("Found {} match(es):\n", unique_matches.len());
+    print_matches_with_context(&unique_matches, context, &directory)?;
 
     Ok(())
 }
