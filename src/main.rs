@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use clap::{Parser, Subcommand};
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -315,17 +316,19 @@ fn search_since_date(date: &str, pattern: &str, context: usize, directory: PathB
         return Ok(());
     }
 
-    let mut all_matches: Vec<BlameMatch> = Vec::new();
-
-    // Only blame files that we know have had changes to the pattern
-    for file in files_to_check {
-        let matches = find_matches_with_blame(&file, pattern, &directory)?;
-        for m in matches {
-            if m.commit_date >= since_date {
-                all_matches.push(m);
-            }
-        }
-    }
+    // Only blame files that we know have had changes to the pattern (in parallel)
+    let files_vec: Vec<String> = files_to_check.into_iter().collect();
+    let all_matches: Vec<BlameMatch> = files_vec
+        .par_iter()
+        .map(|file| {
+            find_matches_with_blame(file, pattern, &directory)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|m| m.commit_date >= since_date)
+                .collect::<Vec<_>>()
+        })
+        .flatten()
+        .collect();
 
     if all_matches.is_empty() {
         println!("No '{}' found in lines added since {}.", pattern, date);
