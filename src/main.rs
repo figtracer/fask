@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Parser)]
@@ -52,29 +52,6 @@ enum Commands {
         #[arg(short = 'D', long, default_value = ".")]
         directory: PathBuf,
     },
-
-    /// Search for TODOs in a specific git commit range
-    Range {
-        /// Starting commit (e.g., "HEAD~10", "abc123")
-        #[arg(short, long)]
-        from: String,
-
-        /// Ending commit (default: "HEAD")
-        #[arg(short, long, default_value = "HEAD")]
-        to: String,
-
-        /// Pattern to search for (default: "TODO")
-        #[arg(short, long, default_value = "TODO")]
-        pattern: String,
-
-        /// Number of context lines to show
-        #[arg(short = 'C', long, default_value = "2")]
-        context: usize,
-
-        /// Directory to search in (default: current directory)
-        #[arg(short = 'D', long, default_value = ".")]
-        directory: PathBuf,
-    },
 }
 
 fn main() -> Result<()> {
@@ -94,14 +71,6 @@ fn main() -> Result<()> {
             context,
             directory,
         } => search_since_date(&date, &pattern, context, directory)?,
-
-        Commands::Range {
-            from,
-            to,
-            pattern,
-            context,
-            directory,
-        } => search_commit_range(&from, &to, &pattern, context, directory)?,
     }
 
     Ok(())
@@ -151,33 +120,8 @@ struct BlameMatch {
     commit_hash: String,
 }
 
-/// Get all tracked files in the repository
-fn get_tracked_files(directory: &PathBuf) -> Result<Vec<String>> {
-    let output = Command::new("git")
-        .arg("ls-files")
-        .current_dir(directory)
-        .output()
-        .context("Failed to execute git ls-files")?;
-
-    if !output.status.success() {
-        anyhow::bail!("git ls-files failed. Is this a git repository?");
-    }
-
-    let files: Vec<String> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|s| s.to_string())
-        .collect();
-
-    Ok(files)
-}
-
 /// Parse git blame output and find matches for the pattern
-fn find_matches_with_blame(
-    file: &str,
-    pattern: &str,
-    directory: &PathBuf,
-) -> Result<Vec<BlameMatch>> {
+fn find_matches_with_blame(file: &str, pattern: &str, directory: &Path) -> Result<Vec<BlameMatch>> {
     let file_path = directory.join(file);
     if !file_path.exists() {
         return Ok(vec![]);
@@ -220,9 +164,9 @@ fn find_matches_with_blame(
                         chrono::DateTime::from_timestamp(timestamp, 0).map(|dt| dt.date_naive());
                 }
             }
-        } else if line.starts_with('\t') {
+        } else if let Some(content) = line.strip_prefix('\t') {
             // This is the actual line content (prefixed with tab)
-            let content = &line[1..]; // Remove the leading tab
+            // Remove the leading tab
 
             if content.contains(pattern) {
                 if let Some(date) = current_date {
@@ -241,31 +185,8 @@ fn find_matches_with_blame(
     Ok(matches)
 }
 
-/// Get the date of a specific commit
-fn get_commit_date(commit: &str, directory: &PathBuf) -> Result<NaiveDate> {
-    let output = Command::new("git")
-        .arg("log")
-        .arg("-1")
-        .arg("--format=%ct")
-        .arg(commit)
-        .current_dir(directory)
-        .output()
-        .context("Failed to get commit date")?;
-
-    if !output.status.success() {
-        anyhow::bail!("Failed to get date for commit {}", commit);
-    }
-
-    let timestamp_str = String::from_utf8_lossy(&output.stdout);
-    let timestamp: i64 = timestamp_str.trim().parse().context("Invalid timestamp")?;
-
-    chrono::DateTime::from_timestamp(timestamp, 0)
-        .map(|dt| dt.date_naive())
-        .context("Failed to parse timestamp")
-}
-
 /// Read file contents to get context lines
-fn read_file_lines(file: &str, directory: &PathBuf) -> Result<Vec<String>> {
+fn read_file_lines(file: &str, directory: &Path) -> Result<Vec<String>> {
     let file_path = directory.join(file);
     let content = std::fs::read_to_string(&file_path)
         .with_context(|| format!("Failed to read file: {}", file_path.display()))?;
@@ -276,7 +197,7 @@ fn read_file_lines(file: &str, directory: &PathBuf) -> Result<Vec<String>> {
 fn print_matches_with_context(
     matches: &[BlameMatch],
     context: usize,
-    directory: &PathBuf,
+    directory: &Path,
 ) -> Result<()> {
     // Group matches by file
     let mut by_file: HashMap<String, Vec<&BlameMatch>> = HashMap::new();
@@ -408,78 +329,6 @@ fn search_since_date(date: &str, pattern: &str, context: usize, directory: PathB
 
     if all_matches.is_empty() {
         println!("No '{}' found in lines added since {}.", pattern, date);
-        return Ok(());
-    }
-
-    println!("Found {} match(es):\n", all_matches.len());
-    print_matches_with_context(&all_matches, context, &directory)?;
-
-    Ok(())
-}
-
-fn search_commit_range(
-    from: &str,
-    to: &str,
-    pattern: &str,
-    context: usize,
-    directory: PathBuf,
-) -> Result<()> {
-    println!(
-        "Searching for '{}' in lines added in range {}..{}...\n",
-        pattern, from, to
-    );
-
-    // Get the dates for the commit range
-    let from_date = get_commit_date(from, &directory)
-        .with_context(|| format!("Failed to resolve commit: {}", from))?;
-    let to_date = get_commit_date(to, &directory)
-        .with_context(|| format!("Failed to resolve commit: {}", to))?;
-
-    // Get commits in the range to build a set of valid commit hashes
-    let commits_output = Command::new("git")
-        .arg("log")
-        .arg("--format=%H")
-        .arg(format!("{}..{}", from, to))
-        .current_dir(&directory)
-        .output()
-        .context("Failed to get commits in range")?;
-
-    if !commits_output.status.success() {
-        anyhow::bail!("Failed to get commits in range {}..{}", from, to);
-    }
-
-    let valid_commits: std::collections::HashSet<String> =
-        String::from_utf8_lossy(&commits_output.stdout)
-            .lines()
-            .map(|s| s.to_string())
-            .collect();
-
-    if valid_commits.is_empty() {
-        println!("No commits found in range {}..{}.", from, to);
-        return Ok(());
-    }
-
-    let files = get_tracked_files(&directory)?;
-
-    let mut all_matches: Vec<BlameMatch> = Vec::new();
-
-    for file in &files {
-        let matches = find_matches_with_blame(file, pattern, &directory)?;
-        for m in matches {
-            // Check if the commit is in our range
-            if valid_commits.contains(&m.commit_hash)
-                || m.commit_date > from_date && m.commit_date <= to_date
-            {
-                all_matches.push(m);
-            }
-        }
-    }
-
-    if all_matches.is_empty() {
-        println!(
-            "No '{}' found in lines added in range {}..{}.",
-            pattern, from, to
-        );
         return Ok(());
     }
 

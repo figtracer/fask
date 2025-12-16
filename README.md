@@ -26,23 +26,10 @@ search todos added after a date (git history)
 -D, --directory <DIR>   directory [default: .]
 ```
 
-### fask range
-
-search todos in commit range
-
-```
---from <COMMIT>         starting commit (e.g., HEAD~10) [required]
---to <COMMIT>           ending commit [default: HEAD]
---pattern <PATTERN>     pattern to search [default: TODO]
--C, --context <N>       context lines [default: 2]
--D, --directory <DIR>   directory [default: .]
-```
-
 ## examples
 
 ```bash
 fask current
 fask current --pattern FIXME --context 5
 fask since --date "2025-12-01"
-fask range --from "HEAD~10"
 ```
