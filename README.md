@@ -40,7 +40,7 @@ search todos in commit range
 
 ## examples
 
-```
+```bash
 fask current
 fask current --pattern FIXME --context 5
 fask since --date "2025-12-01"

@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use clap::{Parser, Subcommand};
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 #[derive(Parser)]
 #[command(name = "fask")]
@@ -112,14 +113,14 @@ fn search_current_files(
     file_type: Option<String>,
     directory: PathBuf,
 ) -> Result<()> {
-    println!("🔍 Searching for '{}' in current files...\n", pattern);
+    println!("Searching for '{}' in current files...\n", pattern);
 
     let mut cmd = Command::new("rg");
     cmd.arg(pattern)
         .arg(format!("-C{}", context))
         .arg("--color=always")
-        .arg("--heading")
-        .arg("--line-number");
+        .arg("--line-number")
+        .arg("--column");
 
     if let Some(ft) = file_type {
         cmd.arg("-g").arg(ft);
@@ -131,15 +132,10 @@ fn search_current_files(
         .output()
         .context("Failed to execute ripgrep. Is 'rg' installed?")?;
 
-    if output.status.success() {
+    if output.status.success() && !output.stdout.is_empty() {
         print!("{}", String::from_utf8_lossy(&output.stdout));
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("No matches found") || output.stdout.is_empty() {
-            println!("No matches found.");
-        } else {
-            eprintln!("{}", stderr);
-        }
+        println!("No matches found.");
     }
 
     Ok(())
@@ -152,39 +148,54 @@ fn search_since_date(date: &str, pattern: &str, context: usize, directory: PathB
 
     println!("Searching for '{}' added since {}...\n", pattern, date);
 
-    let git_cmd = format!(
-        "git log --since=\"{}\" -p --pretty=format:\"%h %ad %s\" --date=short",
-        date
-    );
-
-    let mut git = Command::new("sh")
-        .arg("-c")
-        .arg(&git_cmd)
-        .current_dir(directory)
-        .stdout(Stdio::piped())
-        .spawn()
+    // Get list of files changed since the date
+    let git_files = Command::new("git")
+        .arg("log")
+        .arg(format!("--since={}", date))
+        .arg("--name-only")
+        .arg("--pretty=format:")
+        .arg("--diff-filter=ACMR")
+        .current_dir(&directory)
+        .output()
         .context("Failed to execute git command. Is this a git repository?")?;
 
-    let git_stdout = git.stdout.take().context("Failed to capture git output")?;
+    if !git_files.status.success() {
+        anyhow::bail!("Git command failed. Is this a git repository?");
+    }
 
-    let grep = Command::new("grep")
+    let files_output = String::from_utf8_lossy(&git_files.stdout);
+    let files: HashSet<_> = files_output
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+
+    if files.is_empty() {
+        println!("No files changed since {}.", date);
+        return Ok(());
+    }
+
+    // Search for pattern in those files using ripgrep
+    let mut cmd = Command::new("rg");
+    cmd.arg(pattern)
         .arg(format!("-C{}", context))
         .arg("--color=always")
-        .arg(pattern)
-        .stdin(Stdio::from(git_stdout))
-        .stdout(Stdio::piped())
-        .spawn()
-        .context("Failed to execute grep")?;
+        .arg("--line-number")
+        .arg("--column");
 
-    let output = grep
-        .wait_with_output()
-        .context("Failed to read grep output")?;
-    git.wait()?;
+    // Add each file as an argument
+    for file in files {
+        let file_path = directory.join(file);
+        if file_path.exists() {
+            cmd.arg(&file_path);
+        }
+    }
+
+    let output = cmd.output().context("Failed to execute ripgrep")?;
 
     if output.status.success() && !output.stdout.is_empty() {
         print!("{}", String::from_utf8_lossy(&output.stdout));
     } else {
-        println!("No matches found.");
+        println!("No matches found in files changed since {}.", date);
     }
 
     Ok(())
@@ -202,39 +213,57 @@ fn search_commit_range(
         pattern, from, to
     );
 
-    let git_cmd = format!(
-        "git log {}..{} -p --pretty=format:\"%h %ad %s\" --date=short",
-        from, to
-    );
-
-    let mut git = Command::new("sh")
-        .arg("-c")
-        .arg(&git_cmd)
-        .current_dir(directory)
-        .stdout(Stdio::piped())
-        .spawn()
+    // Get list of files changed in the commit range
+    let git_files = Command::new("git")
+        .arg("log")
+        .arg(format!("{}..{}", from, to))
+        .arg("--name-only")
+        .arg("--pretty=format:")
+        .arg("--diff-filter=ACMR")
+        .current_dir(&directory)
+        .output()
         .context("Failed to execute git command. Is this a git repository?")?;
 
-    let git_stdout = git.stdout.take().context("Failed to capture git output")?;
+    if !git_files.status.success() {
+        anyhow::bail!("Git command failed. Is this a git repository?");
+    }
 
-    let grep = Command::new("grep")
+    let files_output = String::from_utf8_lossy(&git_files.stdout);
+    let files: HashSet<_> = files_output
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+
+    if files.is_empty() {
+        println!("No files changed in range {}..{}.", from, to);
+        return Ok(());
+    }
+
+    // Search for pattern in those files using ripgrep
+    let mut cmd = Command::new("rg");
+    cmd.arg(pattern)
         .arg(format!("-C{}", context))
         .arg("--color=always")
-        .arg(pattern)
-        .stdin(Stdio::from(git_stdout))
-        .stdout(Stdio::piped())
-        .spawn()
-        .context("Failed to execute grep")?;
+        .arg("--line-number")
+        .arg("--column");
 
-    let output = grep
-        .wait_with_output()
-        .context("Failed to read grep output")?;
-    git.wait()?;
+    // Add each file as an argument
+    for file in files {
+        let file_path = directory.join(file);
+        if file_path.exists() {
+            cmd.arg(&file_path);
+        }
+    }
+
+    let output = cmd.output().context("Failed to execute ripgrep")?;
 
     if output.status.success() && !output.stdout.is_empty() {
         print!("{}", String::from_utf8_lossy(&output.stdout));
     } else {
-        println!("No matches found.");
+        println!(
+            "No matches found in files changed in range {}..{}.",
+            from, to
+        );
     }
 
     Ok(())
