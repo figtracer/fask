@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use clap::{Parser, Subcommand};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -141,62 +141,244 @@ fn search_current_files(
     Ok(())
 }
 
-fn search_since_date(date: &str, pattern: &str, context: usize, directory: PathBuf) -> Result<()> {
-    // Validate date format
-    NaiveDate::parse_from_str(date, "%Y-%m-%d")
-        .context("Invalid date format. Use YYYY-MM-DD (e.g., 2025-12-01)")?;
+/// Represents a match found via git blame
+#[derive(Debug)]
+struct BlameMatch {
+    file: String,
+    line_number: usize,
+    line_content: String,
+    commit_date: NaiveDate,
+    commit_hash: String,
+}
 
-    println!("Searching for '{}' added since {}...\n", pattern, date);
-
-    // Get list of files changed since the date
-    let git_files = Command::new("git")
-        .arg("log")
-        .arg(format!("--since={}", date))
-        .arg("--name-only")
-        .arg("--pretty=format:")
-        .arg("--diff-filter=ACMR")
-        .current_dir(&directory)
+/// Get all tracked files in the repository
+fn get_tracked_files(directory: &PathBuf) -> Result<Vec<String>> {
+    let output = Command::new("git")
+        .arg("ls-files")
+        .current_dir(directory)
         .output()
-        .context("Failed to execute git command. Is this a git repository?")?;
+        .context("Failed to execute git ls-files")?;
 
-    if !git_files.status.success() {
-        anyhow::bail!("Git command failed. Is this a git repository?");
+    if !output.status.success() {
+        anyhow::bail!("git ls-files failed. Is this a git repository?");
     }
 
-    let files_output = String::from_utf8_lossy(&git_files.stdout);
-    let files: HashSet<_> = files_output
+    let files: Vec<String> = String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter(|l| !l.trim().is_empty())
+        .map(|s| s.to_string())
         .collect();
 
-    if files.is_empty() {
-        println!("No files changed since {}.", date);
-        return Ok(());
+    Ok(files)
+}
+
+/// Parse git blame output and find matches for the pattern
+fn find_matches_with_blame(
+    file: &str,
+    pattern: &str,
+    directory: &PathBuf,
+) -> Result<Vec<BlameMatch>> {
+    let file_path = directory.join(file);
+    if !file_path.exists() {
+        return Ok(vec![]);
     }
 
-    // Search for pattern in those files using ripgrep
-    let mut cmd = Command::new("rg");
-    cmd.arg(pattern)
-        .arg(format!("-C{}", context))
-        .arg("--color=always")
-        .arg("--line-number")
-        .arg("--column");
+    // Run git blame with porcelain format for easy parsing
+    let output = Command::new("git")
+        .arg("blame")
+        .arg("--line-porcelain")
+        .arg(file)
+        .current_dir(directory)
+        .output()
+        .context("Failed to execute git blame")?;
 
-    // Add each file as an argument
-    for file in files {
-        let file_path = directory.join(file);
-        if file_path.exists() {
-            cmd.arg(&file_path);
+    if !output.status.success() {
+        // File might not be tracked or other git error, skip it
+        return Ok(vec![]);
+    }
+
+    let blame_output = String::from_utf8_lossy(&output.stdout);
+    let mut matches = Vec::new();
+
+    let mut current_hash = String::new();
+    let mut current_line_number = 0usize;
+    let mut current_date: Option<NaiveDate> = None;
+
+    for line in blame_output.lines() {
+        // Line starting with a hash is the header line
+        if line.len() >= 40 && line.chars().take(40).all(|c| c.is_ascii_hexdigit()) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            current_hash = parts[0].to_string();
+            if parts.len() >= 2 {
+                current_line_number = parts[1].parse().unwrap_or(0);
+            }
+        } else if line.starts_with("committer-time ") {
+            // Parse unix timestamp
+            if let Some(timestamp_str) = line.strip_prefix("committer-time ") {
+                if let Ok(timestamp) = timestamp_str.trim().parse::<i64>() {
+                    current_date =
+                        chrono::DateTime::from_timestamp(timestamp, 0).map(|dt| dt.date_naive());
+                }
+            }
+        } else if line.starts_with('\t') {
+            // This is the actual line content (prefixed with tab)
+            let content = &line[1..]; // Remove the leading tab
+
+            if content.contains(pattern) {
+                if let Some(date) = current_date {
+                    matches.push(BlameMatch {
+                        file: file.to_string(),
+                        line_number: current_line_number,
+                        line_content: content.to_string(),
+                        commit_date: date,
+                        commit_hash: current_hash.clone(),
+                    });
+                }
+            }
         }
     }
 
-    let output = cmd.output().context("Failed to execute ripgrep")?;
+    Ok(matches)
+}
 
-    if output.status.success() && !output.stdout.is_empty() {
-        print!("{}", String::from_utf8_lossy(&output.stdout));
-    } else {
-        println!("No matches found in files changed since {}.", date);
+/// Get the date of a specific commit
+fn get_commit_date(commit: &str, directory: &PathBuf) -> Result<NaiveDate> {
+    let output = Command::new("git")
+        .arg("log")
+        .arg("-1")
+        .arg("--format=%ct")
+        .arg(commit)
+        .current_dir(directory)
+        .output()
+        .context("Failed to get commit date")?;
+
+    if !output.status.success() {
+        anyhow::bail!("Failed to get date for commit {}", commit);
     }
+
+    let timestamp_str = String::from_utf8_lossy(&output.stdout);
+    let timestamp: i64 = timestamp_str.trim().parse().context("Invalid timestamp")?;
+
+    chrono::DateTime::from_timestamp(timestamp, 0)
+        .map(|dt| dt.date_naive())
+        .context("Failed to parse timestamp")
+}
+
+/// Read file contents to get context lines
+fn read_file_lines(file: &str, directory: &PathBuf) -> Result<Vec<String>> {
+    let file_path = directory.join(file);
+    let content = std::fs::read_to_string(&file_path)
+        .with_context(|| format!("Failed to read file: {}", file_path.display()))?;
+    Ok(content.lines().map(|s| s.to_string()).collect())
+}
+
+/// Print matches with context
+fn print_matches_with_context(
+    matches: &[BlameMatch],
+    context: usize,
+    directory: &PathBuf,
+) -> Result<()> {
+    // Group matches by file
+    let mut by_file: HashMap<String, Vec<&BlameMatch>> = HashMap::new();
+    for m in matches {
+        by_file.entry(m.file.clone()).or_default().push(m);
+    }
+
+    let mut first_file = true;
+    for (file, file_matches) in by_file {
+        if !first_file {
+            println!();
+        }
+        first_file = false;
+
+        let lines = match read_file_lines(&file, directory) {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+
+        // Sort matches by line number
+        let mut sorted_matches = file_matches;
+        sorted_matches.sort_by_key(|m| m.line_number);
+
+        // Track which lines we've printed to avoid duplicates in overlapping contexts
+        let mut printed_ranges: Vec<(usize, usize)> = Vec::new();
+
+        for m in sorted_matches {
+            let start = m.line_number.saturating_sub(context).max(1);
+            let end = (m.line_number + context).min(lines.len());
+
+            // Check if this overlaps with already printed range
+            let overlaps = printed_ranges.iter().any(|(s, e)| start <= *e && end >= *s);
+
+            if !overlaps {
+                // Print file header with commit info
+                println!(
+                    "\x1b[35m{}\x1b[0m (added \x1b[36m{}\x1b[0m in \x1b[33m{}\x1b[0m)",
+                    file,
+                    m.commit_date,
+                    &m.commit_hash[..8.min(m.commit_hash.len())]
+                );
+
+                for i in start..=end {
+                    if i > lines.len() {
+                        break;
+                    }
+                    let line_content = &lines[i - 1];
+                    if i == m.line_number {
+                        // Highlight the matching line
+                        println!("\x1b[32m{:>4}\x1b[0m: \x1b[1m{}\x1b[0m", i, line_content);
+                    } else {
+                        // Context line
+                        println!("\x1b[2m{:>4}: {}\x1b[0m", i, line_content);
+                    }
+                }
+                printed_ranges.push((start, end));
+            } else {
+                // Just print the match line info if context was already shown
+                println!(
+                    "\x1b[35m{}\x1b[0m:\x1b[32m{}\x1b[0m: {} (added \x1b[36m{}\x1b[0m)",
+                    file,
+                    m.line_number,
+                    m.line_content.trim(),
+                    m.commit_date
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn search_since_date(date: &str, pattern: &str, context: usize, directory: PathBuf) -> Result<()> {
+    // Validate and parse date
+    let since_date = NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .context("Invalid date format. Use YYYY-MM-DD (e.g., 2025-12-01)")?;
+
+    println!(
+        "Searching for '{}' in lines added since {}...\n",
+        pattern, date
+    );
+
+    let files = get_tracked_files(&directory)?;
+
+    let mut all_matches: Vec<BlameMatch> = Vec::new();
+
+    for file in &files {
+        let matches = find_matches_with_blame(file, pattern, &directory)?;
+        for m in matches {
+            if m.commit_date >= since_date {
+                all_matches.push(m);
+            }
+        }
+    }
+
+    if all_matches.is_empty() {
+        println!("No '{}' found in lines added since {}.", pattern, date);
+        return Ok(());
+    }
+
+    println!("Found {} match(es):\n", all_matches.len());
+    print_matches_with_context(&all_matches, context, &directory)?;
 
     Ok(())
 }
@@ -209,62 +391,66 @@ fn search_commit_range(
     directory: PathBuf,
 ) -> Result<()> {
     println!(
-        "Searching for '{}' in commits {}..{}...\n",
+        "Searching for '{}' in lines added in range {}..{}...\n",
         pattern, from, to
     );
 
-    // Get list of files changed in the commit range
-    let git_files = Command::new("git")
+    // Get the dates for the commit range
+    let from_date = get_commit_date(from, &directory)
+        .with_context(|| format!("Failed to resolve commit: {}", from))?;
+    let to_date = get_commit_date(to, &directory)
+        .with_context(|| format!("Failed to resolve commit: {}", to))?;
+
+    // Get commits in the range to build a set of valid commit hashes
+    let commits_output = Command::new("git")
         .arg("log")
+        .arg("--format=%H")
         .arg(format!("{}..{}", from, to))
-        .arg("--name-only")
-        .arg("--pretty=format:")
-        .arg("--diff-filter=ACMR")
         .current_dir(&directory)
         .output()
-        .context("Failed to execute git command. Is this a git repository?")?;
+        .context("Failed to get commits in range")?;
 
-    if !git_files.status.success() {
-        anyhow::bail!("Git command failed. Is this a git repository?");
+    if !commits_output.status.success() {
+        anyhow::bail!("Failed to get commits in range {}..{}", from, to);
     }
 
-    let files_output = String::from_utf8_lossy(&git_files.stdout);
-    let files: HashSet<_> = files_output
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .collect();
+    let valid_commits: std::collections::HashSet<String> =
+        String::from_utf8_lossy(&commits_output.stdout)
+            .lines()
+            .map(|s| s.to_string())
+            .collect();
 
-    if files.is_empty() {
-        println!("No files changed in range {}..{}.", from, to);
+    if valid_commits.is_empty() {
+        println!("No commits found in range {}..{}.", from, to);
         return Ok(());
     }
 
-    // Search for pattern in those files using ripgrep
-    let mut cmd = Command::new("rg");
-    cmd.arg(pattern)
-        .arg(format!("-C{}", context))
-        .arg("--color=always")
-        .arg("--line-number")
-        .arg("--column");
+    let files = get_tracked_files(&directory)?;
 
-    // Add each file as an argument
-    for file in files {
-        let file_path = directory.join(file);
-        if file_path.exists() {
-            cmd.arg(&file_path);
+    let mut all_matches: Vec<BlameMatch> = Vec::new();
+
+    for file in &files {
+        let matches = find_matches_with_blame(file, pattern, &directory)?;
+        for m in matches {
+            // Check if the commit is in our range
+            if valid_commits.contains(&m.commit_hash)
+                || m.commit_date > from_date && m.commit_date <= to_date
+            {
+                all_matches.push(m);
+            }
         }
     }
 
-    let output = cmd.output().context("Failed to execute ripgrep")?;
-
-    if output.status.success() && !output.stdout.is_empty() {
-        print!("{}", String::from_utf8_lossy(&output.stdout));
-    } else {
+    if all_matches.is_empty() {
         println!(
-            "No matches found in files changed in range {}..{}.",
-            from, to
+            "No '{}' found in lines added in range {}..{}.",
+            pattern, from, to
         );
+        return Ok(());
     }
+
+    println!("Found {} match(es):\n", all_matches.len());
+    print_matches_with_context(&all_matches, context, &directory)?;
 
     Ok(())
 }
