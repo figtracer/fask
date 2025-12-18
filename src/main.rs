@@ -219,70 +219,55 @@ fn print_matches_with_context(
     context: usize,
     directory: &Path,
 ) -> Result<()> {
-    // Group matches by file
-    let mut by_file: HashMap<String, Vec<&GitMatch>> = HashMap::new();
-    for m in matches {
-        by_file.entry(m.file.clone()).or_default().push(m);
-    }
+    // Sort all matches by date (oldest first)
+    let mut sorted_matches: Vec<&GitMatch> = matches.iter().collect();
+    sorted_matches.sort_by_key(|m| m.commit_date);
 
-    let mut first_file = true;
-    for (file, file_matches) in by_file {
-        if !first_file {
+    let mut first_match = true;
+    for m in sorted_matches {
+        if !first_match {
             println!();
         }
-        first_file = false;
+        first_match = false;
 
-        let lines = match read_file_lines(&file, directory) {
+        let lines = match read_file_lines(&m.file, directory) {
             Ok(l) => l,
-            Err(_) => continue,
-        };
-
-        // Sort matches by line number
-        let mut sorted_matches = file_matches;
-        sorted_matches.sort_by_key(|m| m.line_number);
-
-        // Track which lines we've printed to avoid duplicates in overlapping contexts
-        let mut printed_ranges: Vec<(usize, usize)> = Vec::new();
-
-        for m in sorted_matches {
-            let start = m.line_number.saturating_sub(context).max(1);
-            let end = (m.line_number + context).min(lines.len());
-
-            // Check if this overlaps with already printed range
-            let overlaps = printed_ranges.iter().any(|(s, e)| start <= *e && end >= *s);
-
-            if !overlaps {
-                // Print file header with commit info
+            Err(_) => {
+                // Print basic info if we can't read the file
                 println!(
-                    "\x1b[35m{}\x1b[0m (added \x1b[36m{}\x1b[0m in \x1b[33m{}\x1b[0m)",
-                    file,
+                    "\x1b[35m{}\x1b[0m:\x1b[32m{}\x1b[0m: {} (added \x1b[36m{}\x1b[0m in \x1b[33m{}\x1b[0m)",
+                    m.file,
+                    m.line_number,
+                    m.line_content.trim(),
                     m.commit_date,
                     &m.commit_hash[..8.min(m.commit_hash.len())]
                 );
+                continue;
+            }
+        };
 
-                for i in start..=end {
-                    if i > lines.len() {
-                        break;
-                    }
-                    let line_content = &lines[i - 1];
-                    if i == m.line_number {
-                        // Highlight the matching line
-                        println!("\x1b[32m{:>4}\x1b[0m: \x1b[1m{}\x1b[0m", i, line_content);
-                    } else {
-                        // Context line
-                        println!("\x1b[2m{:>4}: {}\x1b[0m", i, line_content);
-                    }
-                }
-                printed_ranges.push((start, end));
+        let start = m.line_number.saturating_sub(context).max(1);
+        let end = (m.line_number + context).min(lines.len());
+
+        // Print file header with commit info
+        println!(
+            "\x1b[35m{}\x1b[0m (added \x1b[36m{}\x1b[0m in \x1b[33m{}\x1b[0m)",
+            m.file,
+            m.commit_date,
+            &m.commit_hash[..8.min(m.commit_hash.len())]
+        );
+
+        for i in start..=end {
+            if i > lines.len() {
+                break;
+            }
+            let line_content = &lines[i - 1];
+            if i == m.line_number {
+                // Highlight the matching line
+                println!("\x1b[32m{:>4}\x1b[0m: \x1b[1m{}\x1b[0m", i, line_content);
             } else {
-                // Just print the match line info if context was already shown
-                println!(
-                    "\x1b[35m{}\x1b[0m:\x1b[32m{}\x1b[0m: {} (added \x1b[36m{}\x1b[0m)",
-                    file,
-                    m.line_number,
-                    m.line_content.trim(),
-                    m.commit_date
-                );
+                // Context line
+                println!("\x1b[2m{:>4}: {}\x1b[0m", i, line_content);
             }
         }
     }
